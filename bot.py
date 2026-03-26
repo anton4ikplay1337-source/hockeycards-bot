@@ -11,11 +11,11 @@ import shutil
 from flask import Flask
 
 # ============ НАСТРОЙКИ (ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ============
-TOKEN = os.environ.get('BOT_TOKEN', '8771956491:AAEM1HrlOvnjAS6L2VQZa5xvqsjG64jlhyc')
+TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 
 # Получаем список админов из переменной окружения (через запятую)
 # Пример: "123456789,987654321,555555555"
-admin_ids_str = os.environ.get('ADMIN_IDS', "5706071030,5286431840")
+admin_ids_str = os.environ.get('ADMIN_IDS', '123456789')
 ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(',')]
 
 # Для обратной совместимости (если используется старая переменная ADMIN_ID)
@@ -29,6 +29,9 @@ bot = telebot.TeleBot(TOKEN)
 
 # Словарь для временного хранения данных при добавлении карточки
 temp_card_data = {}
+
+# Словарь для защиты от спама (последнее время открытия)
+last_open_time = {}
 
 # ============ РЕДКОСТИ КАРТОЧЕК ============
 RARITIES = {
@@ -182,6 +185,7 @@ print("💾 Автосохранение запущено (каждые 5 мин
 # ============ ФУНКЦИИ ДЛЯ КД (2 ЧАСА) ============
 def can_open_card(user_id):
     """Проверяет, может ли пользователь открыть карточку"""
+    # Админ может открывать без КД
     if user_id in ADMIN_IDS:
         return True, None, 0
     
@@ -212,12 +216,14 @@ def can_open_card(user_id):
         return False, f"{hours}ч {minutes}м", cards_opened
 
 def update_card_time(user_id):
+    """Обновляет время последнего открытия карточки"""
     conn = sqlite3.connect('hockey_cards.db')
     cursor = conn.cursor()
     now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     cursor.execute("UPDATE users SET last_card_time = ?, cards_opened = cards_opened + 1 WHERE user_id = ?", (now, user_id))
     conn.commit()
     conn.close()
+    print(f"✅ КД обновлен для {user_id}: {now}")
 
 def get_user_stats(user_id):
     conn = sqlite3.connect('hockey_cards.db')
@@ -398,10 +404,53 @@ def send_welcome(message):
     
     bot.send_message(message.chat.id, welcome_text, reply_markup=main_keyboard(), parse_mode='Markdown')
 
+@bot.message_handler(commands=['mycd'])
+def my_cd(message):
+    """Показывает текущий статус КД"""
+    user_id = message.from_user.id
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_card_time, cards_opened FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result or not result[0]:
+        bot.send_message(message.chat.id, "✅ **КД нет!** Вы можете открыть карточку прямо сейчас!", parse_mode='Markdown')
+        return
+    
+    try:
+        last_time = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+        next_available = last_time + timedelta(hours=2)
+        now = datetime.now()
+        
+        if now >= next_available:
+            bot.send_message(message.chat.id, "✅ **КД нет!** Вы можете открыть карточку прямо сейчас!", parse_mode='Markdown')
+        else:
+            wait_time = next_available - now
+            hours = int(wait_time.total_seconds() // 3600)
+            minutes = int((wait_time.total_seconds() % 3600) // 60)
+            bot.send_message(
+                message.chat.id,
+                f"⏰ **КД активен!**\n\nСледующая карточка через: **{hours}ч {minutes}м**\n\n📊 Всего открыто: {result[1] if result[1] else 0}",
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Ошибка: {e}")
+
 @bot.message_handler(func=lambda message: message.text == '🎴 Открыть карточку')
 def open_card(message):
     user_id = message.from_user.id
+    now_time = time.time()
     
+    # Защита от спама (5 секунд между нажатиями)
+    if user_id in last_open_time:
+        if now_time - last_open_time[user_id] < 5:
+            bot.send_message(message.chat.id, "⏳ **Подожди 5 секунд перед следующим открытием!**", parse_mode='Markdown')
+            return
+    last_open_time[user_id] = now_time
+    
+    # Проверяем КД
     can_open, wait_time, cards_opened = can_open_card(user_id)
     
     if not can_open:
@@ -412,21 +461,28 @@ def open_card(message):
         )
         return
     
+    # Получаем случайную карточку
     card = get_random_card()
     
     if not card:
         bot.send_message(message.chat.id, "❌ В базе пока нет карточек! Обратитесь к администратору.")
         return
     
+    # Обновляем время (ВАЖНО! ДОЛЖНО БЫТЬ ПЕРЕД ОТПРАВКОЙ КАРТОЧКИ)
     update_card_time(user_id)
+    
+    # Сохраняем в коллекцию
     save_user_card(user_id, card[0])
+    
+    # Отправляем карточку
     send_card(message, card)
     
+    # Отправляем сообщение о следующей карточке
     next_time = datetime.now() + timedelta(hours=2)
     next_time_str = next_time.strftime('%H:%M:%S')
     bot.send_message(
         message.chat.id,
-        f"⏰ Следующую карточку можно открыть через 2 часа (после {next_time_str})",
+        f"⏰ Следующую карточку можно открыть через **2 часа** (после {next_time_str})",
         parse_mode='Markdown'
     )
 
@@ -538,7 +594,9 @@ def admin_panel(message):
         "⚡ **Сбросить свой КД** — /resetcd\n"
         "💾 **Бэкап** — /backup\n"
         "📊 **Статистика БД** — /dbstats\n"
-        "👑 **Админы** — /admins",
+        "👑 **Админы** — /admins\n"
+        "➕ **Добавить админа** — /addadmin @username\n"
+        "➖ **Удалить админа** — /removeadmin @username",
         reply_markup=admin_keyboard(),
         parse_mode='Markdown'
     )
@@ -597,7 +655,6 @@ def manual_backup(message):
         backup_name = f"backups/hockey_cards_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
         shutil.copy2('hockey_cards.db', backup_name)
         
-        # Отправляем бэкап в Telegram
         with open(backup_name, 'rb') as f:
             bot.send_document(message.chat.id, f, caption=f"✅ Бэкап создан: {backup_name}")
         
@@ -998,6 +1055,7 @@ if __name__ == '__main__':
     print("📸 Можно добавлять карточки с изображениями!")
     print("💾 Автосохранение: каждые 5 минут")
     print("📦 Авто-бэкап: каждые 24 часа")
+    print("🛡️ Защита от спама: 5 секунд между открытиями")
     
     while True:
         try:
