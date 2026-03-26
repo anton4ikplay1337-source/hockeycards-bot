@@ -130,6 +130,7 @@ def register_user(user_id, username):
 
 # ============ АВТОМАТИЧЕСКИЙ БЭКАП ============
 def backup_database():
+    """Создает резервную копию базы данных"""
     try:
         if os.path.exists('hockey_cards.db'):
             if not os.path.exists('backups'):
@@ -142,6 +143,7 @@ def backup_database():
             backups = sorted([f for f in os.listdir('backups') if f.startswith('hockey_cards_backup_')])
             for old_backup in backups[:-10]:
                 os.remove(os.path.join('backups', old_backup))
+                print(f"🗑️ Удален старый бэкап: {old_backup}")
     except Exception as e:
         print(f"⚠️ Ошибка бэкапа: {e}")
 
@@ -161,10 +163,13 @@ def auto_save_loop():
         except:
             pass
 
+# Запускаем фоновые процессы
 backup_thread = threading.Thread(target=auto_backup_loop, daemon=True)
 backup_thread.start()
 save_thread = threading.Thread(target=auto_save_loop, daemon=True)
 save_thread.start()
+print("🔄 Авто-бэкап запущен (каждые 24 часа)")
+print("💾 Автосохранение запущено (каждые 5 минут)")
 
 # ============ ФУНКЦИИ ДЛЯ КД ============
 def can_open_card(user_id):
@@ -300,7 +305,6 @@ def get_card_text(card):
     return text
 
 def get_card_keyboard(card_id, user_id):
-    """Клавиатура для отдельной карточки"""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     
     conn = sqlite3.connect('hockey_cards.db')
@@ -319,34 +323,429 @@ def get_card_keyboard(card_id, user_id):
     keyboard.add(btn_collect, btn_share, btn_back)
     return keyboard
 
-# ============ ИНЛАЙН-МЕНЮ ============
-def main_menu_keyboard():
-    """Главное меню с инлайн-кнопками"""
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    btn_open = types.InlineKeyboardButton(text="🎴 Открыть карточку", callback_data="open_card")
-    btn_collection = types.InlineKeyboardButton(text="📚 Моя коллекция", callback_data="show_collection_0")
-    btn_stats = types.InlineKeyboardButton(text="📊 Статистика", callback_data="show_stats")
-    btn_rarities = types.InlineKeyboardButton(text="💎 Редкости", callback_data="show_rarities")
-    
-    # Кнопка для админов
-    if message_from_user_id_in_admin():
-        btn_admin = types.InlineKeyboardButton(text="🔧 Админ-панель", callback_data="admin_panel")
-        keyboard.add(btn_open, btn_collection, btn_stats, btn_rarities, btn_admin)
-    else:
-        keyboard.add(btn_open, btn_collection, btn_stats, btn_rarities)
-    
-    return keyboard
-
-def message_from_user_id_in_admin():
-    """Заглушка для проверки, будет заменено в обработчиках"""
-    return False
-
 def back_to_menu_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main"))
     return keyboard
 
-# ============ ОБРАБОТЧИКИ ============
+# ============ ТЕКСТОВЫЕ АДМИН-КОМАНДЫ ============
+@bot.message_handler(commands=['backup'])
+def manual_backup(message):
+    """Создает ручной бэкап базы данных"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        if not os.path.exists('backups'):
+            os.makedirs('backups')
+        
+        backup_name = f"backups/hockey_cards_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        shutil.copy2('hockey_cards.db', backup_name)
+        
+        with open(backup_name, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption=f"✅ Бэкап создан: {backup_name}")
+        
+        bot.send_message(message.chat.id, f"✅ Бэкап создан! Файл сохранен в папке backups/")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['restore'])
+def restore_backup(message):
+    """Показывает список доступных бэкапов"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        if not os.path.exists('backups'):
+            bot.send_message(message.chat.id, "📭 Папка с бэкапами не найдена.\n\nИспользуйте `/backup` чтобы создать первый бэкап.", parse_mode='Markdown')
+            return
+        
+        backups = sorted([f for f in os.listdir('backups') if f.startswith('hockey_cards_backup_')])
+        
+        if not backups:
+            bot.send_message(message.chat.id, "📭 Нет доступных бэкапов.\n\nИспользуйте `/backup` чтобы создать бэкап.", parse_mode='Markdown')
+            return
+        
+        text = "📋 **Доступные бэкапы:**\n\n"
+        for i, backup in enumerate(backups[-10:], 1):
+            backup_path = os.path.join('backups', backup)
+            backup_size = os.path.getsize(backup_path) / 1024
+            backup_date = backup.replace('hockey_cards_backup_', '').replace('.db', '')
+            text += f"{i}. `{backup}`\n   📦 {backup_size:.1f} KB | 📅 {backup_date}\n\n"
+        
+        text += "💡 **Для восстановления используй:**\n`/uploadbackup` — отправь файл бэкапа\n\nИли через Shell на Render (если есть доступ):\n`cp backups/имя_файла.db hockey_cards.db`"
+        
+        bot.send_message(message.chat.id, text, parse_mode='Markdown')
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['uploadbackup'])
+def upload_backup_command(message):
+    """Загружает бэкап из присланного файла"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    bot.send_message(message.chat.id, "📤 **Отправьте файл бэкапа (.db) для восстановления базы данных**\n\n⚠️ ВНИМАНИЕ: Текущая база будет заменена! Предварительно создайте бэкап через /backup", parse_mode='Markdown')
+    bot.register_next_step_handler(message, process_uploaded_backup)
+
+def process_uploaded_backup(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    if not message.document:
+        bot.send_message(message.chat.id, "❌ Отправьте файл! Используйте /uploadbackup и прикрепите файл .db")
+        return
+    
+    try:
+        # Создаем бэкап текущей базы
+        if os.path.exists('hockey_cards.db'):
+            if not os.path.exists('backups'):
+                os.makedirs('backups')
+            current_backup = f"backups/before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+            shutil.copy2('hockey_cards.db', current_backup)
+            bot.send_message(message.chat.id, f"📦 Создан бэкап текущей базы: `{current_backup}`", parse_mode='Markdown')
+        
+        # Скачиваем файл
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # Сохраняем файл
+        backup_name = f"restored_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        with open(backup_name, 'wb') as f:
+            f.write(downloaded_file)
+        
+        # Восстанавливаем
+        shutil.copy2(backup_name, 'hockey_cards.db')
+        
+        # Сохраняем копию в папку backups
+        if not os.path.exists('backups'):
+            os.makedirs('backups')
+        shutil.copy2(backup_name, f"backups/{backup_name}")
+        
+        # Удаляем временный файл
+        os.remove(backup_name)
+        
+        # Проверяем восстановленную базу
+        conn = sqlite3.connect('hockey_cards.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM cards")
+        cards_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users")
+        users_count = cursor.fetchone()[0]
+        conn.close()
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ **База данных восстановлена!**\n\n"
+            f"🃏 Карточек: {cards_count}\n"
+            f"👥 Игроков: {users_count}\n"
+            f"📦 Бэкап сохранен в папке backups/\n\n"
+            f"⚠️ **Перезапустите бота для применения изменений!**",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['dbstats'])
+def db_stats(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    
+    db_size = os.path.getsize('hockey_cards.db') / 1024
+    
+    cursor.execute("SELECT COUNT(*) FROM cards")
+    total_cards = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM user_cards")
+    total_collections = cursor.fetchone()[0]
+    
+    backups = []
+    if os.path.exists('backups'):
+        backups = sorted([f for f in os.listdir('backups') if f.startswith('hockey_cards_backup_')])[-5:]
+    
+    conn.close()
+    
+    text = f"📊 **СТАТИСТИКА БАЗЫ ДАННЫХ**\n\n"
+    text += f"💾 **Размер БД:** {db_size:.1f} KB\n"
+    text += f"🃏 **Всего карточек:** {total_cards}\n"
+    text += f"👥 **Всего игроков:** {total_users}\n"
+    text += f"📚 **Всего в коллекциях:** {total_collections}\n\n"
+    
+    if backups:
+        text += f"📦 **Последние бэкапы:**\n"
+        for backup in backups:
+            backup_path = os.path.join('backups', backup)
+            backup_size = os.path.getsize(backup_path) / 1024
+            text += f"• {backup} ({backup_size:.1f} KB)\n"
+    
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['resetcd'])
+def reset_cd(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) == 1:
+            user_id = message.from_user.id
+            conn = sqlite3.connect('hockey_cards.db')
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET last_card_time = NULL WHERE user_id = ?", (user_id,))
+            conn.commit()
+            conn.close()
+            bot.send_message(message.chat.id, "✅ Ваш КД сброшен! Можете открыть новую карточку.")
+            
+        elif len(parts) == 2:
+            user_input = parts[1].replace('@', '')
+            conn = sqlite3.connect('hockey_cards.db')
+            cursor = conn.cursor()
+            
+            if user_input.isdigit():
+                cursor.execute("UPDATE users SET last_card_time = NULL WHERE user_id = ?", (int(user_input),))
+            else:
+                cursor.execute("UPDATE users SET last_card_time = NULL WHERE username = ?", (user_input,))
+            
+            conn.commit()
+            affected = cursor.rowcount
+            conn.close()
+            
+            if affected > 0:
+                bot.send_message(message.chat.id, f"✅ КД сброшен для {user_input}")
+            else:
+                bot.send_message(message.chat.id, f"❌ Пользователь {user_input} не найден")
+        else:
+            bot.send_message(message.chat.id, "❌ Используйте:\n/resetcd — для себя\n/resetcd @username — для другого")
+            
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['addadmin'])
+def add_admin(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ /addadmin @username или /addadmin ID")
+            return
+        
+        user_input = parts[1].replace('@', '')
+        
+        conn = sqlite3.connect('hockey_cards.db')
+        cursor = conn.cursor()
+        
+        if user_input.isdigit():
+            cursor.execute("SELECT user_id, username FROM users WHERE user_id = ?", (int(user_input),))
+        else:
+            cursor.execute("SELECT user_id, username FROM users WHERE username = ?", (user_input,))
+        
+        user = cursor.fetchone()
+        
+        if not user:
+            bot.send_message(message.chat.id, f"❌ Пользователь {user_input} не найден!")
+            conn.close()
+            return
+        
+        new_admin_id, username = user
+        
+        if new_admin_id in ADMIN_IDS:
+            bot.send_message(message.chat.id, f"⚠️ @{username} уже является админом!")
+            conn.close()
+            return
+        
+        ADMIN_IDS.append(new_admin_id)
+        cursor.execute("INSERT OR REPLACE INTO admins (user_id) VALUES (?)", (new_admin_id,))
+        conn.commit()
+        conn.close()
+        
+        bot.send_message(message.chat.id, f"✅ @{username} теперь админ!")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['removeadmin'])
+def remove_admin(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ /removeadmin @username или /removeadmin ID")
+            return
+        
+        user_input = parts[1].replace('@', '')
+        
+        conn = sqlite3.connect('hockey_cards.db')
+        cursor = conn.cursor()
+        
+        if user_input.isdigit():
+            cursor.execute("SELECT user_id, username FROM users WHERE user_id = ?", (int(user_input),))
+        else:
+            cursor.execute("SELECT user_id, username FROM users WHERE username = ?", (user_input,))
+        
+        user = cursor.fetchone()
+        
+        if not user:
+            bot.send_message(message.chat.id, f"❌ Пользователь {user_input} не найден!")
+            conn.close()
+            return
+        
+        admin_id, username = user
+        
+        if admin_id == message.from_user.id:
+            bot.send_message(message.chat.id, "❌ Вы не можете удалить самого себя!")
+            conn.close()
+            return
+        
+        if admin_id not in ADMIN_IDS:
+            bot.send_message(message.chat.id, f"⚠️ @{username} не является админом!")
+            conn.close()
+            return
+        
+        ADMIN_IDS.remove(admin_id)
+        cursor.execute("DELETE FROM admins WHERE user_id = ?", (admin_id,))
+        conn.commit()
+        conn.close()
+        
+        bot.send_message(message.chat.id, f"✅ @{username} больше не админ!")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['admins'])
+def list_admins(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    text = "👑 **СПИСОК АДМИНОВ**\n\n"
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    
+    for admin_id in ADMIN_IDS:
+        cursor.execute("SELECT username FROM users WHERE user_id = ?", (admin_id,))
+        result = cursor.fetchone()
+        username = result[0] if result else str(admin_id)
+        text += f"• @{username} (ID: {admin_id})\n"
+    
+    conn.close()
+    
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['cardslist'])
+def cards_list(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT card_id, name, team, rarity FROM cards ORDER BY card_id")
+    cards = cursor.fetchall()
+    conn.close()
+    
+    if not cards:
+        bot.send_message(message.chat.id, "📭 В базе нет карточек.")
+        return
+    
+    text = "📋 **СПИСОК КАРТОЧЕК**\n\n"
+    for card in cards:
+        rarity_info = RARITIES[card[3]]
+        text += f"{rarity_info['emoji']} **ID:{card[0]}** {card[1]} ({card[2]}) — {rarity_info['name']}\n"
+    
+    bot.send_message(message.chat.id, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['delcard'])
+def delete_card(message):
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ Нет прав!")
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ /delcard ID_карточки")
+            return
+        
+        card_id = int(parts[1])
+        
+        conn = sqlite3.connect('hockey_cards.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, image_path FROM cards WHERE card_id = ?", (card_id,))
+        card = cursor.fetchone()
+        
+        if not card:
+            bot.send_message(message.chat.id, f"❌ Карточка с ID {card_id} не найдена!")
+            conn.close()
+            return
+        
+        if card[1] and os.path.exists(card[1]):
+            os.remove(card[1])
+        
+        cursor.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
+        cursor.execute("DELETE FROM user_cards WHERE card_id = ?", (card_id,))
+        conn.commit()
+        conn.close()
+        
+        bot.send_message(message.chat.id, f"✅ Карточка **{card[0]}** удалена!", parse_mode='Markdown')
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['mycd'])
+def my_cd(message):
+    user_id = message.from_user.id
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_card_time, cards_opened FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result or not result[0]:
+        bot.send_message(message.chat.id, "✅ **КД нет!** Вы можете открыть карточку прямо сейчас!", parse_mode='Markdown')
+        return
+    
+    try:
+        last_time = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+        next_available = last_time + timedelta(hours=2)
+        now = datetime.now()
+        
+        if now >= next_available:
+            bot.send_message(message.chat.id, "✅ **КД нет!** Вы можете открыть карточку прямо сейчас!", parse_mode='Markdown')
+        else:
+            wait_time = next_available - now
+            hours = int(wait_time.total_seconds() // 3600)
+            minutes = int((wait_time.total_seconds() % 3600) // 60)
+            bot.send_message(
+                message.chat.id,
+                f"⏰ **КД активен!**\n\nСледующая карточка через: **{hours}ч {minutes}м**\n\n📊 Всего открыто: {result[1] if result[1] else 0}",
+                parse_mode='Markdown'
+            )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"⚠️ Ошибка: {e}")
+
+# ============ ОСНОВНОЕ МЕНЮ ============
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
@@ -357,11 +756,11 @@ def send_welcome(message):
     collection_count = get_user_collection_count(user_id)
     total_cards = get_total_cards_count()
     
-    is_admin = "👑 Вы администратор!" if user_id in ADMIN_IDS else ""
+    is_admin = "👑 **Вы администратор!**" if user_id in ADMIN_IDS else ""
     
-    welcome_text = f"""🏒 **ХОККЕЙНЫЕ КАРТОЧКИ КХЛ**
+    welcome_text = f"""🏒 **КАРТОЧКИ МХЛ** {is_admin}
 
-📇 **Добро пожаловать!** {is_admin}
+📇 **Добро пожаловать!**
 
 🎴 **Что ты можешь делать:**
 • Открывать новые карточки (КД 2 часа)
@@ -397,11 +796,11 @@ def back_to_main(call):
     collection_count = get_user_collection_count(user_id)
     total_cards = get_total_cards_count()
     
-    is_admin = "👑 Вы администратор!" if user_id in ADMIN_IDS else ""
+    is_admin = "👑 **Вы администратор!**" if user_id in ADMIN_IDS else ""
     
-    welcome_text = f"""🏒 **ХОККЕЙНЫЕ КАРТОЧКИ КХЛ**
+    welcome_text = f"""🏒 **КАРТОЧКИ МХЛ** {is_admin}
 
-📇 **Главное меню** {is_admin}
+📇 **Главное меню**
 
 📊 **Твоя статистика:**
 • 🎴 Открыто карточек: {cards_opened}
@@ -532,7 +931,6 @@ def show_collection_callback(call):
         text += f"{rarity_info['emoji']} **{card[1]}** ({card[2]}) — {rarity_info['name']}\n"
         text += f"   🆔 #{card[0]}\n\n"
     
-    # Создаем клавиатуру для пагинации
     keyboard = types.InlineKeyboardMarkup(row_width=3)
     
     if page > 0:
@@ -543,7 +941,6 @@ def show_collection_callback(call):
     if page < total_pages - 1:
         keyboard.add(types.InlineKeyboardButton(text="Следующая ▶️", callback_data=f"show_collection_{page+1}"))
     
-    # Кнопка для просмотра конкретной карточки
     if cards:
         view_keyboard = types.InlineKeyboardMarkup(row_width=2)
         for card in cards[:5]:
@@ -587,7 +984,6 @@ def collect_card_callback(call):
         save_user_card(user_id, card_id)
         bot.answer_callback_query(call.id, "✅ Карточка добавлена в коллекцию!", show_alert=True)
         
-        # Обновляем кнопки
         card = get_card_by_id(card_id)
         if card:
             card_text = get_card_text(card)
@@ -604,10 +1000,11 @@ def share_card_callback(call):
     
     if card:
         rarity_info = RARITIES[card[4]]
-        share_text = f"🏒 Хоккейная карточка\n\n{rarity_info['icon']} {card[1]} ({card[2]}) — {rarity_info['name']}\n🌍 {card[3]}\n🆔 #{card_id}\n\nПолучи свою карточку!"
+        share_text = f"🏒 Карточка МХЛ\n\n{rarity_info['icon']} {card[1]} ({card[2]}) — {rarity_info['name']}\n🌍 {card[3]}\n🆔 #{card_id}\n\nПолучи свою карточку!"
         bot.answer_callback_query(call.id, "Карточка скопирована!", show_alert=True)
         bot.send_message(call.message.chat.id, share_text, parse_mode='Markdown')
 
+# ============ АДМИН-ПАНЕЛЬ (ИНЛАЙН) ============
 @bot.callback_query_handler(func=lambda call: call.data == "admin_panel")
 def admin_panel_callback(call):
     user_id = call.from_user.id
@@ -618,7 +1015,7 @@ def admin_panel_callback(call):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     btn_add_card = types.InlineKeyboardButton(text="➕ Добавить карточку", callback_data="add_card_start")
     btn_cards_list = types.InlineKeyboardButton(text="📋 Список карточек", callback_data="cards_list")
-    btn_backup = types.InlineKeyboardButton(text="💾 Создать бэкап", callback_data="backup_db")
+    btn_backup = types.InlineKeyboardButton(text="💾 Создать бэкап", callback_data="backup_now")
     btn_reset_cd = types.InlineKeyboardButton(text="⏰ Сбросить КД себе", callback_data="reset_my_cd")
     btn_stats = types.InlineKeyboardButton(text="📊 Статистика БД", callback_data="db_stats")
     btn_admins = types.InlineKeyboardButton(text="👑 Список админов", callback_data="list_admins")
@@ -629,23 +1026,8 @@ def admin_panel_callback(call):
                          call.message.chat.id, call.message.message_id,
                          reply_markup=keyboard, parse_mode='Markdown')
 
-@bot.callback_query_handler(func=lambda call: call.data == "reset_my_cd")
-def reset_my_cd_callback(call):
-    user_id = call.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(call.id, "❌ Нет прав!", show_alert=True)
-        return
-    
-    conn = sqlite3.connect('hockey_cards.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET last_card_time = NULL WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Ваш КД сброшен! Можете открыть новую карточку.", show_alert=True)
-
-@bot.callback_query_handler(func=lambda call: call.data == "backup_db")
-def backup_db_callback(call):
+@bot.callback_query_handler(func=lambda call: call.data == "backup_now")
+def backup_now_callback(call):
     user_id = call.from_user.id
     if user_id not in ADMIN_IDS:
         bot.answer_callback_query(call.id, "❌ Нет прав!", show_alert=True)
@@ -661,10 +1043,31 @@ def backup_db_callback(call):
         with open(backup_name, 'rb') as f:
             bot.send_document(call.message.chat.id, f, caption=f"✅ Бэкап создан: {backup_name}")
         
-        bot.answer_callback_query(call.id, "✅ Бэкап создан и отправлен!", show_alert=True)
+        bot.answer_callback_query(call.id, "✅ Бэкап создан!", show_alert=True)
+        
+        # Возвращаемся в админ-панель
+        admin_panel_callback(call)
         
     except Exception as e:
         bot.answer_callback_query(call.id, f"❌ Ошибка: {e}", show_alert=True)
+
+@bot.callback_query_handler(func=lambda call: call.data == "reset_my_cd")
+def reset_my_cd_callback(call):
+    user_id = call.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "❌ Нет прав!", show_alert=True)
+        return
+    
+    conn = sqlite3.connect('hockey_cards.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET last_card_time = NULL WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Ваш КД сброшен! Можете открыть новую карточку.", show_alert=True)
+    
+    # Возвращаемся в админ-панель
+    admin_panel_callback(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "db_stats")
 def db_stats_callback(call):
@@ -744,7 +1147,6 @@ def cards_list_callback(call):
         rarity_info = RARITIES[card[3]]
         text += f"{rarity_info['emoji']} **ID:{card[0]}** {card[1]} ({card[2]}) — {rarity_info['name']}\n"
     
-    # Если текст слишком длинный, отправляем как есть
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton(text="🗑️ Удалить карточку", callback_data="delete_card_menu"))
     keyboard.add(types.InlineKeyboardButton(text="◀️ Назад", callback_data="admin_panel"))
@@ -789,7 +1191,7 @@ def process_delete_card(message, chat_id, msg_id):
         
         bot.send_message(message.chat.id, f"✅ Карточка **{card[0]}** удалена!")
         
-        # Возвращаемся к админ-панели
+        # Возвращаемся в админ-панель
         admin_panel_callback(message)
         
     except ValueError:
@@ -904,7 +1306,7 @@ flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def health():
-    return "🏒 Hockey Cards Bot is running on Render! 🎴"
+    return "🏒 Cards MHL Bot is running! 🎴"
 
 @flask_app.route('/ping')
 def ping():
@@ -920,12 +1322,12 @@ print("🌐 Веб-сервер запущен на порту 8080")
 if __name__ == '__main__':
     init_db()
     update_db_users()
-    print("🤖 Бот хоккейных карточек запущен!")
+    print("🤖 Бот карточек МХЛ запущен!")
     print("💎 Редкости: Обычная (45%), Редкая (25%), Эпическая (15%), Мифическая (10%), Легендарная (5%)")
     print("⏰ КД на открытие: 2 ЧАСА")
     print(f"👑 Количество админов: {len(ADMIN_IDS)}")
     print("🎮 Все кнопки - инлайн!")
-    print("📚 Добавлен просмотр всех карточек с пагинацией")
+    print("💾 Команды бэкапа: /backup, /restore, /uploadbackup, /dbstats")
     
     while True:
         try:
